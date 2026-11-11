@@ -186,3 +186,7 @@ h2.big { font-size: 26px; margin: 4px 0 6px; }
 .specs .when { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
 select[multiple] { min-height: 120px; }
 @media (max-width: 640px) { .hero { grid-template-columns: 1fr; } }
+.banner {
+  display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  background: #1f4d3d; color: var(--accent); border-radius: 10px; padding: 8px 12px; margin-top: 10px;
+}

@@ -1,0 +1,8 @@
+{
+  "name": "hobbytron-3000",
+  "private": true,
+  "description": "A hobby tamagotchi. No build step: open index.html.",
+  "scripts": {
+    "sync-hangar": "node scripts/sync-hangar.mjs"
+  }
+}
