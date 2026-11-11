@@ -1,0 +1,596 @@
+// Hobbytron 3000: a hobby tamagotchi. All data lives in localStorage.
+'use strict';
+
+const STORE_KEY = 'hobbytron3000.v2';
+const DAY = 86400000;
+// Energy fades with a ~1 week half-life-ish decay. Hitting your weekly goal
+// steadily keeps a hobby near 100%.
+const DECAY_DAYS = 7;
+
+const DEFAULT_HOBBIES = [
+  { name: 'Hardware', emoji: '🔧', color: '#7cf5c4', goal: 180 },
+  { name: 'Ham Radio', emoji: '📻', color: '#ff9de2', goal: 90 },
+  { name: 'Fabrication', emoji: '🖨️', color: '#f5e663', goal: 90 },
+  { name: 'Piano', emoji: '🎹', color: '#c39bff', goal: 150 },
+  { name: 'Drones', emoji: '🛸', color: '#5ec8ff', goal: 120 },
+  { name: 'RC', emoji: '🏎️', color: '#ffb454', goal: 120 },
+];
+
+// The Hangar (hangar/fleet.js) groups devices by category; each category
+// feeds one hobby's energy when you log time on that gear.
+const CATEGORY_HOBBY = {
+  'e-ink': 'Hardware',
+  microcontroller: 'Hardware',
+  'ai-gadget': 'Hardware',
+  radio: 'Ham Radio',
+  'radio-accessories': 'Ham Radio',
+  fabrication: 'Fabrication',
+  drones: 'Drones',
+  rc: 'RC',
+  music: 'Piano',
+};
+const EXTRA_CATEGORIES = [
+  { key: 'drones', label: 'Drones' },
+  { key: 'rc', label: 'RC' },
+  { key: 'music', label: 'Music' },
+  { key: 'other', label: 'Other' },
+];
+
+const STATUS = {
+  active: { label: 'Active', dot: 'ok' },
+  experimenting: { label: 'Experimenting', dot: 'warn' },
+  'needs-work': { label: 'Needs work', dot: 'bad' },
+  shelved: { label: 'Shelved', dot: 'off' },
+};
+
+const FLEET = window.FLEET || { categories: [], devices: [], ideas: [] };
+const SVGS = window.HANGAR_SVGS || {};
+
+const PALETTE = ['#7cf5c4', '#c39bff', '#5ec8ff', '#ffb454', '#ff6b81', '#f5e663', '#8cff6b', '#ff9de2'];
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const today = () => ymd(new Date());
+
+// ---------- state ----------
+
+function seed() {
+  const hobbies = DEFAULT_HOBBIES.map((h) => ({ id: uid(), ...h }));
+  const byName = Object.fromEntries(hobbies.map((h) => [h.name, h.id]));
+  const devices = FLEET.devices.map((d) => ({
+    ...structuredClone(d),
+    hobbyId: byName[CATEGORY_HOBBY[d.category]] || '',
+  }));
+  const deviceByName = Object.fromEntries(devices.map((d) => [d.name, d]));
+  return {
+    petName: 'Tronnie',
+    hobbies,
+    sessions: [],
+    categories: [...FLEET.categories, ...EXTRA_CATEGORIES],
+    devices,
+    ideas: FLEET.ideas.map((i) => ({
+      id: uid(),
+      title: i.title,
+      note: i.note,
+      deviceIds: (i.devices || []).map((n) => deviceByName[n]?.id).filter(Boolean),
+      done: false,
+    })),
+  };
+}
+
+function load() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* fall through to seed */ }
+  return seed();
+}
+
+let state = load();
+const save = () => {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+};
+
+// Point devices whose hobby no longer exists (e.g. after importing an older
+// export) back at the hobby their category feeds, matched by name.
+function relinkDevices() {
+  const ids = new Set(state.hobbies.map((h) => h.id));
+  state.devices.forEach((d) => {
+    if (d.hobbyId && ids.has(d.hobbyId)) return;
+    d.hobbyId = state.hobbies.find((h) => h.name === CATEGORY_HOBBY[d.category])?.id || '';
+  });
+}
+
+// ---------- energy math ----------
+
+function sessionAge(s, now = Date.now()) {
+  return Math.max(0, (now - new Date(s.date + 'T12:00:00').getTime()) / DAY);
+}
+
+function energy(hobby) {
+  const decayed = state.sessions
+    .filter((s) => s.hobbyId === hobby.id)
+    .reduce((sum, s) => sum + s.minutes * Math.exp(-sessionAge(s) / DECAY_DAYS), 0);
+  return Math.min(100, Math.round((decayed / Math.max(1, hobby.goal)) * 100));
+}
+
+function minutesThisWeek(hobbyId) {
+  return state.sessions
+    .filter((s) => s.hobbyId === hobbyId && sessionAge(s) < 7)
+    .reduce((sum, s) => sum + s.minutes, 0);
+}
+
+function streak(hobbyId) {
+  const days = new Set(state.sessions.filter((s) => !hobbyId || s.hobbyId === hobbyId).map((s) => s.date));
+  let n = 0;
+  const d = new Date();
+  // Today not logged yet doesn't break the streak.
+  if (!days.has(ymd(d))) d.setDate(d.getDate() - 1);
+  while (days.has(ymd(d))) { n++; d.setDate(d.getDate() - 1); }
+  return n;
+}
+
+function lastDone(hobbyId) {
+  const dates = state.sessions.filter((s) => s.hobbyId === hobbyId).map((s) => s.date).sort();
+  if (!dates.length) return 'never';
+  const days = Math.floor(sessionAge({ date: dates.at(-1) }) + 0.5);
+  return days === 0 ? 'today' : days === 1 ? 'yesterday' : `${days}d ago`;
+}
+
+function petStatus() {
+  const es = state.hobbies.map(energy);
+  const avg = es.length ? es.reduce((a, b) => a + b, 0) / es.length : 0;
+  const totalMin = state.sessions.reduce((a, s) => a + s.minutes, 0);
+  const level = Math.floor(Math.sqrt(totalMin / 60)) + 1;
+  const nextAt = Math.pow(level, 2) * 60;
+  let mood = 'sleepy';
+  if (avg >= 70) mood = 'ecstatic';
+  else if (avg >= 40) mood = 'happy';
+  else if (avg >= 15) mood = 'restless';
+  const neglected = state.hobbies.filter((h) => energy(h) < 15).map((h) => h.name);
+  return { avg, level, mood, totalMin, nextAt, neglected };
+}
+
+const MOOD_TEXT = {
+  ecstatic: 'Buzzing with energy!',
+  happy: 'Content and humming along.',
+  restless: 'Getting a bit restless…',
+  sleepy: 'Low power. Feed me a hobby!',
+};
+
+// ---------- creature ----------
+
+function creatureSVG(mood, level) {
+  const mouth = {
+    ecstatic: 'M70 118 Q100 150 130 118 Z',
+    happy: 'M74 120 Q100 140 126 120',
+    restless: 'M78 126 L122 126',
+    sleepy: 'M80 130 Q100 120 120 130',
+  }[mood];
+  const eyes = mood === 'sleepy'
+    ? '<path d="M64 92 Q76 100 88 92 M112 92 Q124 100 136 92" stroke="#0f1220" stroke-width="5" fill="none" stroke-linecap="round"/>'
+    : '<circle cx="76" cy="90" r="11" fill="#0f1220"/><circle cx="124" cy="90" r="11" fill="#0f1220"/><circle cx="80" cy="86" r="4" fill="#fff"/><circle cx="128" cy="86" r="4" fill="#fff"/>';
+  const glow = { ecstatic: '#7cf5c4', happy: '#5ec8ff', restless: '#ffb454', sleepy: '#8a90b3' }[mood];
+  // Antennae sprout as the creature levels up.
+  const antennae = Math.min(level, 5);
+  let ant = '';
+  for (let i = 0; i < antennae; i++) {
+    const x = 100 + (i - (antennae - 1) / 2) * 22;
+    ant += `<line x1="100" y1="40" x2="${x}" y2="${8 - (i % 2) * 6}" stroke="${glow}" stroke-width="3"/><circle cx="${x}" cy="${8 - (i % 2) * 6}" r="6" fill="${glow}"/>`;
+  }
+  return `<svg viewBox="0 0 200 200" role="img" aria-label="Hobbytron creature, ${mood}">
+    <defs><radialGradient id="body" cx="40%" cy="35%"><stop offset="0" stop-color="#ffffff" stop-opacity=".9"/><stop offset=".25" stop-color="${glow}"/><stop offset="1" stop-color="#2a3160"/></radialGradient></defs>
+    <ellipse cx="100" cy="190" rx="60" ry="8" fill="#000" opacity=".3"/>
+    ${ant}
+    <rect x="30" y="38" width="140" height="140" rx="56" fill="url(#body)" stroke="${glow}" stroke-width="3"/>
+    <rect x="52" y="64" width="96" height="84" rx="30" fill="#e8eaf6" opacity=".92"/>
+    ${eyes}
+    <path d="${mouth}" stroke="#0f1220" stroke-width="5" fill="${mood === 'ecstatic' ? '#ff6b81' : 'none'}" stroke-linecap="round"/>
+    ${mood === 'happy' || mood === 'ecstatic' ? '<circle cx="62" cy="114" r="7" fill="#ff9de2" opacity=".6"/><circle cx="138" cy="114" r="7" fill="#ff9de2" opacity=".6"/>' : ''}
+    <text x="100" y="172" text-anchor="middle" font-size="13" font-family="monospace" fill="#0f1220" font-weight="700">LV ${level}</text>
+  </svg>`;
+}
+
+function ringSVG(pct, color) {
+  const r = 28, c = 2 * Math.PI * r;
+  return `<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="${r}" fill="#181c30" stroke="#2c3358" stroke-width="6"/>
+    ${pct > 0 ? `<circle cx="32" cy="32" r="${r}" fill="none" stroke="${color}" stroke-width="6" stroke-linecap="round"
+      stroke-dasharray="${(pct / 100) * c} ${c}"/>` : ''}</svg>`;
+}
+
+// ---------- views ----------
+
+let tab = 'habitat';
+let hangarFilter = 'all';
+let deviceId = null; // open device detail in the Hangar tab
+
+function render() {
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  const view = $('#view');
+  view.innerHTML = { habitat: habitatView, hangar: hangarView, log: logView, settings: settingsView }[tab]();
+  bindView(view);
+}
+
+function habitatView() {
+  const p = petStatus();
+  const nodes = [...state.hobbies, { add: true }];
+  const n = nodes.length;
+  const orbit = nodes.map((h, i) => {
+    const a = (i / n) * 2 * Math.PI - Math.PI / 2;
+    const x = 50 + 38 * Math.cos(a), y = 50 + 38 * Math.sin(a);
+    if (h.add) {
+      return `<button class="node add" data-action="add-hobby" style="left:${x}%;top:${y}%">
+        <div class="ring">${ringSVG(0, '#2c3358')}<div class="emoji">＋</div></div><div class="label muted">Add hobby</div></button>`;
+    }
+    const e = energy(h);
+    return `<button class="node ${e < 15 ? 'low' : ''}" data-action="log" data-id="${h.id}" style="left:${x}%;top:${y}%" title="Log ${esc(h.name)}">
+      <div class="ring">${ringSVG(e, h.color)}<div class="emoji">${esc(h.emoji)}</div></div>
+      <div class="label">${esc(h.name)}</div><div class="pct">${e}%</div></button>`;
+  }).join('');
+
+  const bars = state.hobbies.map((h) => {
+    const e = energy(h);
+    return `<div class="bar-row">
+      <div class="who">${esc(h.emoji)} ${esc(h.name)}</div>
+      <div class="bar"><i style="width:${e}%;background:${h.color}"></i></div>
+      <div class="meta">${minutesThisWeek(h.id)}/${h.goal}m · ${lastDone(h.id)}</div></div>`;
+  }).join('');
+
+  const nudge = p.neglected.length
+    ? `<p class="muted">${esc(state.petName)} misses: <b>${p.neglected.map(esc).join(', ')}</b>. Even 10 minutes helps.</p>`
+    : '<p class="muted">Every hobby is charged. Nice work.</p>';
+
+  return `
+    <div class="habitat">
+      <div class="orbit-ring"></div>
+      <div class="creature ${p.mood}" data-action="rename" title="Click to rename">
+        ${creatureSVG(p.mood, p.level)}
+        <div class="name">${esc(state.petName)}</div>
+        <div class="mood">${MOOD_TEXT[p.mood]}</div>
+      </div>
+      ${orbit}
+    </div>
+    <section class="panel">
+      <div class="row spread"><h2>Energy bars</h2><span class="muted">Tap a hobby in orbit to log time</span></div>
+      <div class="bars">${bars || '<p class="muted">No hobbies yet.</p>'}</div>
+      ${nudge}
+    </section>
+    <section class="stats">
+      <div class="stat"><b>${p.level}</b><span>Level (${Math.round(p.totalMin / 60)}h / ${Math.round(p.nextAt / 60)}h to next)</span></div>
+      <div class="stat"><b>${Math.round(p.avg)}%</b><span>Average energy</span></div>
+      <div class="stat"><b>${streak()}</b><span>Day streak (any hobby)</span></div>
+      <div class="stat"><b>${state.sessions.length}</b><span>Sessions logged</span></div>
+    </section>`;
+}
+
+function deviceArt(d) {
+  const svg = d.art && SVGS[d.art];
+  // As <img> so each SVG keeps its own gradient/filter ids.
+  return svg
+    ? `<img src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}" alt="">`
+    : `<div class="art-emoji">${esc(d.emoji || '🧰')}</div>`;
+}
+
+const hobbyOf = (id) => state.hobbies.find((h) => h.id === id);
+const catLabel = (k) => state.categories.find((c) => c.key === k)?.label || k;
+const deviceMinutes = (id) => state.sessions.filter((s) => s.deviceId === id).reduce((a, s) => a + s.minutes, 0);
+
+function hangarView() {
+  if (deviceId && state.devices.some((d) => d.id === deviceId)) return deviceView(deviceId);
+  const counts = Object.fromEntries(Object.keys(STATUS).map((k) => [k, state.devices.filter((d) => d.status === k).length]));
+  const usedHobbies = state.hobbies.filter((h) => state.devices.some((d) => d.hobbyId === h.id));
+  const chips = [['all', 'All'], ...usedHobbies.map((h) => [h.id, `${h.emoji} ${h.name}`])].map(([k, label]) =>
+    `<button data-action="hangar-filter" data-k="${k}" class="${hangarFilter === k ? 'active' : ''}">${esc(label)}</button>`).join('');
+  const shown = state.devices.filter((d) => hangarFilter === 'all' || d.hobbyId === hangarFilter);
+  const sections = state.categories.map((cat) => {
+    const inCat = shown.filter((d) => d.category === cat.key);
+    if (!inCat.length) return '';
+    const tiles = inCat.map((d) => {
+      const st = STATUS[d.status] || STATUS.shelved;
+      return `<button class="obj" data-action="open-device" data-id="${d.id}" aria-label="${esc(d.name)}">
+        <span class="art">${deviceArt(d)}</span>
+        <span class="label"><span class="nm">${esc(d.name)}</span>
+        <span class="fw"><span class="dot ${st.dot}"></span>${esc(d.firmware || st.label)}</span></span></button>`;
+    }).join('');
+    return `<section class="cat"><h3>${esc(cat.label)}</h3><div class="grid">${tiles}</div></section>`;
+  }).join('');
+  const ideas = state.ideas.map((i) => {
+    const on = i.deviceIds.map((id) => state.devices.find((d) => d.id === id)?.name).filter(Boolean);
+    return `<div class="item ${i.done ? 'done' : ''}"><div class="grow"><b>${esc(i.title)}</b>
+      <div class="muted">${esc(i.note)}${on.length ? `<br>↳ ${on.map(esc).join(' · ')}` : ''}</div></div>
+      <button class="ghost" data-action="toggle-idea" data-id="${i.id}">${i.done ? 'Undo' : 'Done ✓'}</button>
+      <button class="ghost danger" data-action="del-idea" data-id="${i.id}" title="Delete">✕</button></div>`;
+  }).join('');
+  return `<section class="panel">
+    <div class="row spread"><h2>🛠️ The Hangar</h2><button class="primary" data-action="add-device">Add device</button></div>
+    <div class="stats" style="margin:10px 0 14px">
+      <div class="stat"><b>${state.devices.length}</b><span>Devices</span></div>
+      <div class="stat"><b>${counts.active}</b><span>Active</span></div>
+      <div class="stat"><b>${counts.experimenting + counts['needs-work']}</b><span>In the works</span></div>
+      <div class="stat"><b>${state.ideas.filter((i) => !i.done).length}</b><span>Up next</span></div>
+    </div>
+    <div class="chips">${chips}</div>
+    <div class="desk">${sections || '<p class="muted">No devices for this hobby yet.</p>'}</div></section>
+  <section class="panel"><div class="row spread"><h2>What's next</h2><button data-action="add-idea">Add idea</button></div>
+    <div class="list">${ideas || '<p class="muted">No ideas queued.</p>'}</div></section>`;
+}
+
+function deviceView(id) {
+  const d = state.devices.find((x) => x.id === id);
+  const st = STATUS[d.status] || STATUS.shelved;
+  const h = hobbyOf(d.hobbyId);
+  const chips = [d.model, d.platform, d.firmware && `Firmware: ${d.firmware}`].filter(Boolean).map((c) => `<span class="tag">${esc(c)}</span>`).join(' ');
+  const hl = (d.highlights || []).map((x) => `<li>${esc(x)}</li>`).join('');
+  const hist = (d.history || []).map((x) => `<tr><th>${esc(x.firmware)}${x.date ? `<span class="when">${esc(x.date)}</span>` : ''}</th><td>${esc(x.note)}</td></tr>`).join('');
+  const sessions = state.sessions.filter((s) => s.deviceId === id).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10)
+    .map((s) => `<li>${s.date} · ${s.minutes}m${s.note ? ' · ' + esc(s.note) : ''}</li>`).join('');
+  return `<section class="panel device">
+    <button class="ghost" data-action="close-device">← Back to the Hangar</button>
+    <div class="hero">
+      <div class="hero-shot">${deviceArt(d)}</div>
+      <div>
+        <p class="muted"><span class="dot ${st.dot}"></span>${st.label} · ${esc(catLabel(d.category))} · ${h ? esc(h.emoji + ' ' + h.name) : 'No hobby'}</p>
+        <h2 class="big">${esc(d.name)}</h2>
+        ${d.tagline ? `<p class="muted">${esc(d.tagline)}</p>` : ''}
+        <div class="row" style="margin:8px 0">${chips}</div>
+        <p class="muted">${Math.round(deviceMinutes(id) / 6) / 10}h logged on this device</p>
+        <div class="row">
+          <button class="primary" data-action="log-device" data-id="${id}">Log bench time</button>
+          <button data-action="flash-device" data-id="${id}">Log firmware flash</button>
+          <button class="ghost" data-action="edit-device" data-id="${id}">Edit</button>
+        </div>
+      </div>
+    </div>
+    ${d.story ? `<h3>The story</h3><p>${esc(d.story)}</p>` : ''}
+    ${hl ? `<h3>Highlights</h3><ul>${hl}</ul>` : ''}
+    ${hist ? `<h3>Firmware history</h3><table class="specs">${hist}</table>` : ''}
+    ${sessions ? `<h3>Recent sessions</h3><ul>${sessions}</ul>` : ''}
+  </section>`;
+}
+
+function logView() {
+  const dev = (id) => id && state.devices.find((d) => d.id === id);
+  const recent = [...state.sessions].sort((a, b) => b.date.localeCompare(a.date) || b.created - a.created).slice(0, 100);
+  const list = recent.map((s) => {
+    const h = state.hobbies.find((x) => x.id === s.hobbyId);
+    return `<div class="item"><div class="grow"><b>${h ? esc(h.emoji + ' ' + h.name) : 'Deleted hobby'}</b> · ${s.minutes}m
+      <div class="muted">${s.date}${dev(s.deviceId) ? ' · ' + esc(dev(s.deviceId).name) : ''}${s.note ? ' · ' + esc(s.note) : ''}</div></div>
+      <button class="ghost danger" data-action="del-session" data-id="${s.id}">Delete</button></div>`;
+  }).join('');
+  const hobbies = state.hobbies.map((h) => `<div class="item"><div class="grow"><b>${esc(h.emoji)} ${esc(h.name)}</b>
+      <div class="muted">Goal ${h.goal} min/week · streak ${streak(h.id)}d</div></div>
+      <button class="ghost" data-action="edit-hobby" data-id="${h.id}">Edit</button></div>`).join('');
+  return `<section class="panel"><div class="row spread"><h2>Hobbies</h2><button class="primary" data-action="add-hobby">Add hobby</button></div>
+      <div class="list">${hobbies}</div></section>
+    <section class="panel"><div class="row spread"><h2>Recent sessions</h2><button data-action="log">Log session</button></div>
+      <div class="list">${list || '<p class="muted">No sessions yet. Tap a hobby on the Habitat to log one.</p>'}</div></section>`;
+}
+
+function settingsView() {
+  return `<section class="panel"><h2>Your data</h2>
+    <p class="muted">Everything is stored in this browser only. Export a backup to move it to another device.</p>
+    <div class="row">
+      <button data-action="export">Export JSON</button>
+      <label class="row" style="display:inline-flex"><input type="file" accept="application/json" id="import" hidden>
+        <button data-action="import">Import JSON</button></label>
+      <button class="danger" data-action="reset">Reset everything</button>
+    </div></section>`;
+}
+
+// ---------- dialogs ----------
+
+function openDialog(html, onSubmit) {
+  const dlg = $('#dlg');
+  dlg.innerHTML = html;
+  const form = $('form', dlg);
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (e.submitter && e.submitter.value === 'cancel') return dlg.close();
+    const data = Object.fromEntries(new FormData(form));
+    onSubmit(data, e.submitter && e.submitter.value);
+    dlg.close();
+    save();
+    render();
+  });
+  dlg.showModal();
+}
+
+const hobbyOptions = (sel) => state.hobbies.map((h) => `<option value="${h.id}" ${h.id === sel ? 'selected' : ''}>${esc(h.emoji + ' ' + h.name)}</option>`).join('');
+
+function logDialog(hobbyId, devId) {
+  if (!state.hobbies.length) return hobbyDialog();
+  const dev = state.devices.find((d) => d.id === devId);
+  if (dev && dev.hobbyId) hobbyId = dev.hobbyId;
+  openDialog(`<form><h2>Log a session</h2>
+    <label>Hobby<select name="hobbyId">${hobbyOptions(hobbyId)}</select></label>
+    <label>Device (optional)<select name="deviceId"></select></label>
+    <label>Minutes<input name="minutes" type="number" min="1" max="1440" value="30" required></label>
+    <div class="quick">${[10, 20, 30, 45, 60, 90, 120].map((m) => `<button type="button" data-min="${m}">${m}m</button>`).join('')}</div>
+    <label>Date<input name="date" type="date" value="${today()}" max="${today()}" required></label>
+    <label>What did you do?<textarea name="note" placeholder="Practised scales, soldered the VTX, tuned the shocks…"></textarea></label>
+    <div class="row"><button class="primary" value="save">Feed ${esc(state.petName)}</button><button value="cancel" formnovalidate>Cancel</button></div></form>`,
+  (d) => {
+    const before = energy(state.hobbies.find((h) => h.id === d.hobbyId));
+    state.sessions.push({ id: uid(), hobbyId: d.hobbyId, deviceId: d.deviceId || '', minutes: Math.max(1, +d.minutes), date: d.date, note: d.note.trim(), created: Date.now() });
+    const h = state.hobbies.find((x) => x.id === d.hobbyId);
+    toast(`${h.emoji} ${h.name} +${energy(h) - before}% energy`);
+  });
+  document.querySelectorAll('#dlg [data-min]').forEach((b) =>
+    b.addEventListener('click', () => { $('#dlg [name=minutes]').value = b.dataset.min; }));
+  const hobbySel = $('#dlg [name=hobbyId]'), devSel = $('#dlg [name=deviceId]');
+  const fillDevices = () => {
+    const list = state.devices.filter((d) => d.hobbyId === hobbySel.value);
+    devSel.innerHTML = '<option value="">None</option>' + list.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('');
+    devSel.closest('label').hidden = !list.length;
+    if (dev && list.includes(dev)) devSel.value = dev.id;
+  };
+  hobbySel.addEventListener('change', fillDevices);
+  fillDevices();
+}
+
+function hobbyDialog(id) {
+  const h = state.hobbies.find((x) => x.id === id) || { name: '', emoji: '⭐', color: PALETTE[state.hobbies.length % PALETTE.length], goal: 120 };
+  openDialog(`<form><h2>${id ? 'Edit' : 'New'} hobby</h2>
+    <label>Name<input name="name" value="${esc(h.name)}" required placeholder="e.g. 3D printing, Woodworking, Guitar"></label>
+    <div class="row"><label style="flex:1">Emoji<input name="emoji" value="${esc(h.emoji)}" maxlength="4" required></label>
+      <label style="flex:1">Color<input name="color" type="color" value="${h.color}"></label></div>
+    <label>Weekly goal (minutes)<input name="goal" type="number" min="10" step="10" value="${h.goal}" required></label>
+    <div class="row"><button class="primary" value="save">Save</button>
+      ${id ? '<button value="delete" class="danger" formnovalidate>Delete</button>' : ''}
+      <button value="cancel" formnovalidate>Cancel</button></div></form>`,
+  (d, action) => {
+    if (action === 'delete') {
+      if (!confirm(`Delete ${h.name}? Its logged sessions will be removed too.`)) return;
+      state.hobbies = state.hobbies.filter((x) => x.id !== id);
+      state.sessions = state.sessions.filter((s) => s.hobbyId !== id);
+      state.devices.forEach((g) => { if (g.hobbyId === id) g.hobbyId = ''; });
+      return;
+    }
+    const next = { name: d.name.trim(), emoji: d.emoji.trim(), color: d.color, goal: Math.max(10, +d.goal) };
+    if (id) Object.assign(h, next);
+    else state.hobbies.push({ id: uid(), ...next });
+  });
+}
+
+function deviceDialog(id) {
+  const d = state.devices.find((x) => x.id === id) ||
+    { name: '', emoji: '🧰', category: 'other', status: 'active', firmware: '', model: '', hobbyId: state.hobbies[0]?.id, tagline: '', story: '' };
+  const opts = (obj, sel) => obj.map(([k, v]) => `<option value="${esc(k)}" ${k === sel ? 'selected' : ''}>${esc(v)}</option>`).join('');
+  openDialog(`<form><h2>${id ? 'Edit' : 'New'} device</h2>
+    <label>Name<input name="name" value="${esc(d.name)}" required placeholder="e.g. 5&quot; freestyle quad"></label>
+    <div class="row">
+      <label style="flex:1">Hobby<select name="hobbyId"><option value="">None</option>${hobbyOptions(d.hobbyId)}</select></label>
+      <label style="flex:1">Category<select name="category">${opts(state.categories.map((c) => [c.key, c.label]), d.category)}</select></label>
+    </div>
+    <div class="row">
+      <label style="flex:1">Status<select name="status">${opts(Object.entries(STATUS).map(([k, v]) => [k, v.label]), d.status)}</select></label>
+      ${d.art ? '' : `<label style="width:90px">Emoji<input name="emoji" value="${esc(d.emoji || '🧰')}" maxlength="4"></label>`}
+    </div>
+    <label>Model<input name="model" value="${esc(d.model)}"></label>
+    <label>Firmware / setup<input name="firmware" value="${esc(d.firmware)}" placeholder="e.g. Betaflight 4.5, stock"></label>
+    <label>Tagline<input name="tagline" value="${esc(d.tagline)}"></label>
+    <label>Story / notes<textarea name="story">${esc(d.story)}</textarea></label>
+    <div class="row"><button class="primary" value="save">Save</button>
+      ${id ? '<button value="delete" class="danger" formnovalidate>Delete</button>' : ''}
+      <button value="cancel" formnovalidate>Cancel</button></div></form>`,
+  (f, action) => {
+    if (action === 'delete') {
+      if (!confirm(`Remove ${d.name} from the Hangar?`)) return;
+      state.devices = state.devices.filter((x) => x.id !== id);
+      state.ideas.forEach((i) => { i.deviceIds = i.deviceIds.filter((x) => x !== id); });
+      deviceId = null;
+      return;
+    }
+    const next = {
+      name: f.name.trim(), hobbyId: f.hobbyId, category: f.category, status: f.status,
+      model: f.model.trim(), firmware: f.firmware.trim(), tagline: f.tagline.trim(), story: f.story.trim(),
+    };
+    if (f.emoji !== undefined) next.emoji = f.emoji.trim();
+    if (id) Object.assign(d, next);
+    else state.devices.push({ id: uid(), platform: '', highlights: [], history: [], ...next });
+  });
+}
+
+function flashDialog(id) {
+  const d = state.devices.find((x) => x.id === id);
+  openDialog(`<form><h2>Flash ${esc(d.name)}</h2>
+    <label>Firmware now on the device<input name="firmware" value="${esc(d.firmware)}" required></label>
+    <label>What changed?<textarea name="note" placeholder="Fixed the deep-sleep loop, moved buffers to PSRAM…"></textarea></label>
+    <div class="row">
+      <label style="flex:1">Date<input name="date" type="date" value="${today()}" max="${today()}" required></label>
+      <label style="flex:1">Bench minutes<input name="minutes" type="number" min="0" max="1440" value="30"></label>
+    </div>
+    <div class="row"><button class="primary" value="save">Save</button><button value="cancel" formnovalidate>Cancel</button></div></form>`,
+  (f) => {
+    const fw = f.firmware.trim();
+    d.history = [{ firmware: fw, date: f.date, note: f.note.trim() }, ...(d.history || [])];
+    d.firmware = fw;
+    const mins = Math.max(0, +f.minutes || 0);
+    if (mins && d.hobbyId) {
+      state.sessions.push({ id: uid(), hobbyId: d.hobbyId, deviceId: id, minutes: mins, date: f.date, note: `Flashed ${fw}`, created: Date.now() });
+      const h = hobbyOf(d.hobbyId);
+      toast(`${h.emoji} ${h.name} fed: ${mins}m on ${d.name}`);
+    }
+  });
+}
+
+function ideaDialog() {
+  openDialog(`<form><h2>New idea</h2>
+    <label>Title<input name="title" required placeholder="e.g. Tune the quad's PIDs"></label>
+    <label>Notes<textarea name="note"></textarea></label>
+    <label>Devices<select name="deviceIds" multiple size="6">${state.devices.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}</select></label>
+    <div class="row"><button class="primary" value="save">Add</button><button value="cancel" formnovalidate>Cancel</button></div></form>`,
+  (f) => {
+    const ids = [...$('#dlg [name=deviceIds]').selectedOptions].map((o) => o.value);
+    state.ideas.push({ id: uid(), title: f.title.trim(), note: f.note.trim(), deviceIds: ids, done: false });
+  });
+}
+
+function toast(msg) {
+  document.querySelectorAll('.toast').forEach((x) => x.remove());
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2500);
+}
+
+// ---------- events ----------
+
+function bindView(view) {
+  view.querySelectorAll('[data-action]').forEach((el) => el.addEventListener('click', () => {
+    const { action, id, k } = el.dataset;
+    switch (action) {
+      case 'log': return logDialog(id);
+      case 'add-hobby': return hobbyDialog();
+      case 'edit-hobby': return hobbyDialog(id);
+      case 'add-device': return deviceDialog();
+      case 'edit-device': return deviceDialog(id);
+      case 'open-device': deviceId = id; render(); return window.scrollTo(0, 0);
+      case 'close-device': deviceId = null; return render();
+      case 'log-device': return logDialog(null, id);
+      case 'flash-device': return flashDialog(id);
+      case 'hangar-filter': hangarFilter = k; return render();
+      case 'add-idea': return ideaDialog();
+      case 'toggle-idea': {
+        const i = state.ideas.find((x) => x.id === id);
+        i.done = !i.done; save(); if (i.done) toast('Idea shipped 🚀'); return render();
+      }
+      case 'del-idea':
+        state.ideas = state.ideas.filter((x) => x.id !== id); save(); return render();
+      case 'del-session':
+        state.sessions = state.sessions.filter((s) => s.id !== id); save(); return render();
+      case 'rename': {
+        const name = prompt('Name your Hobbytron:', state.petName);
+        if (name && name.trim()) { state.petName = name.trim(); save(); render(); }
+        return;
+      }
+      case 'export': {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' }));
+        a.download = `hobbytron-${today()}.json`;
+        a.click();
+        return;
+      }
+      case 'import': return $('#import').click();
+      case 'reset':
+        if (confirm('Erase all hobbies, sessions and Hangar edits and start fresh?')) { state = seed(); save(); render(); }
+        return;
+    }
+  }));
+  const imp = $('#import', view);
+  if (imp) imp.addEventListener('change', async () => {
+    try {
+      const data = JSON.parse(await imp.files[0].text());
+      if (!Array.isArray(data.hobbies) || !Array.isArray(data.sessions)) throw new Error('bad file');
+      state = { ...seed(), ...data };
+      relinkDevices();
+      save(); toast('Imported'); tab = 'habitat'; render();
+    } catch (e) { alert('That file does not look like a Hobbytron export.'); }
+  });
+}
+
+document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => { tab = b.dataset.tab; deviceId = null; render(); }));
+render();
